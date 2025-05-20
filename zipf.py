@@ -31,7 +31,9 @@ class SymbolDataset(Dataset):
 
 def train(path, epochs=10, batch=4096, lr=0.1,
           plot=None, plot_diff=None, diff_thresh=0.05,
-          schedule='constant', switch_patience=3, switch_delta=1e-3):
+          plot_loss=None, plot_ce=None,
+          schedule='constant', alpha=1.0,
+          switch_patience=3, switch_delta=1e-3):
     """
     Train a unigram model to fit Zipf's law via SGD.
     Args:
@@ -47,6 +49,7 @@ def train(path, epochs=10, batch=4096, lr=0.1,
                   'auto' keeps lr constant until the epoch loss fails to
                   improve by more than switch_delta for switch_patience epochs,
                   then switches to 1/t decay.
+        alpha: exponent for 'power' schedule (lr = lr0 / t^alpha).
         switch_patience: epochs to wait before switching (auto mode).
         switch_delta: minimum loss improvement to reset patience.
     """
@@ -60,11 +63,22 @@ def train(path, epochs=10, batch=4096, lr=0.1,
 
     ce = torch.nn.CrossEntropyLoss()
 
+    # empirical unigram distribution by model index
+    counts = Counter(ds.tokens)
+    total = len(ds.tokens)
+    emp_dist = np.zeros(V, dtype=float)
+    for tok, idx in ds.vocab.items():
+        emp_dist[idx] = counts[tok] / total
+
     step = 0                   # global step counter
     initial_lr = lr
     mode = schedule          # may change from 'auto' to 'invtime'
     prev_loss = None
     stale_epochs = 0
+
+    step_list = []
+    loss_list = []
+    ce_list = []
 
     for ep in range(epochs):
         for x in loader:                       # x shape: (B,)
@@ -73,8 +87,14 @@ def train(path, epochs=10, batch=4096, lr=0.1,
             loss.backward()
             opt.step()
             step += 1
-            if mode == 'invtime':
-                new_lr = initial_lr / (step + 1)
+            step_list.append(step)
+            loss_list.append(loss.item())
+            # compute true cross-entropy against empirical distribution
+            probs_np = torch.softmax(logits, 0).detach().cpu().numpy()
+            ce_true = -np.sum(emp_dist * np.log(probs_np + 1e-12))
+            ce_list.append(ce_true)
+            if mode in ('invtime', 'power'):
+                new_lr = initial_lr / ((step + 1) ** (alpha if mode == 'power' else 1.0))
                 opt.param_groups[0]['lr'] = new_lr
         current_lr = opt.param_groups[0]['lr']
         print(f'Epoch {ep+1}: loss {loss.item():.4f}  |  lr {current_lr:.3e}')
@@ -94,14 +114,27 @@ def train(path, epochs=10, batch=4096, lr=0.1,
     probs = torch.softmax(logits, 0).detach().cpu().numpy()
     id2sym = {i: s for s, i in ds.vocab.items()}
     model = {id2sym[i]: float(p) for i, p in enumerate(probs)}
-    with open('zipf_probs.json', 'w', encoding='utf‑8') as f:
-        json.dump(model, f, ensure_ascii=False, indent=2)
-
-    # pre‑compute empirical and learned rank‑frequency lists
+    # compute empirical counts once
     counts = Counter(ds.tokens)
     total = len(ds.tokens)
+
+    # dump counts + learned probabilities side‑by‑side
+    stats = {tok: {"count": counts[tok], "prob": model.get(tok, 0.0)}
+             for tok in counts}
+
+    with open('zipf_stats.json', 'w', encoding='utf-8') as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+    print("Wrote counts+probs to zipf_stats.json")
+
+    # pre‑compute empirical and learned rank‑frequency lists
     emp_freq = [c / total for _, c in counts.most_common()]
     learned_freq = sorted(model.values(), reverse=True)
+
+    # ----- Compute and display entropies (in nats) -----
+    emp_entropy = -sum(p * math.log(p) for p in emp_freq if p > 0)
+    learned_entropy = -sum(p * math.log(p) for p in learned_freq if p > 0)
+    print(f'Empirical unigram entropy: {emp_entropy:.4f} nats/token')
+    print(f'Learned  unigram entropy: {learned_entropy:.4f} nats/token')
 
     # ----- Plot learned vs. empirical rank–frequency -----
     if plot:
@@ -145,6 +178,28 @@ def train(path, epochs=10, batch=4096, lr=0.1,
         else:
             print(f'No ranks exceeded diff_thresh={diff_thresh}; no diff plot written.')
 
+    # ----- Plot loss vs. global steps -----
+    if plot_loss:
+        plt.figure(figsize=(6, 4))
+        plt.plot(step_list, loss_list)
+        plt.xlabel('step')
+        plt.ylabel('loss')
+        plt.title('Loss vs global step')
+        plt.tight_layout()
+        plt.savefig(plot_loss)
+        print(f'Loss vs steps plot saved to {plot_loss}')
+
+    # ----- Plot true cross-entropy vs. global steps -----
+    if plot_ce:
+        plt.figure(figsize=(6, 4))
+        plt.plot(step_list, ce_list)
+        plt.xlabel('step')
+        plt.ylabel('true cross-entropy')
+        plt.title('Cross-entropy vs global step')
+        plt.tight_layout()
+        plt.savefig(plot_ce)
+        print(f'True cross-entropy plot saved to {plot_ce}')
+
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('file', help='plain‑text corpus')
@@ -153,18 +208,24 @@ if __name__ == '__main__':
     ap.add_argument('--lr', type=float, default=0.1)
     ap.add_argument('--plot', default=None,
                     help='Path to save log–log rank–frequency plot')
-    ap.add_argument('--schedule', choices=['constant', 'invtime', 'auto'],
+    ap.add_argument('--plot-loss', default=None,
+                    help='Path to save loss vs. global step plot')
+    ap.add_argument('--plot-ce', default=None,
+                    help='Path to save true cross-entropy vs global step plot')
+    ap.add_argument('--schedule', choices=['constant', 'invtime', 'power', 'auto'],
                     default='constant',
                     help="Learning‑rate schedule: constant or 1/t ('invtime')")
+    ap.add_argument('--alpha', type=float, default=1.0,
+                    help='exponent for --schedule power (default 1.0)')
     ap.add_argument('--plot-diff', default=None,
                     help='Path to save plot of ranks where learned vs empirical differ')
     ap.add_argument('--diff-thresh', type=float, default=0.1,
                     help='Relative difference threshold for --plot-diff')
     ap.add_argument('--switch-patience', type=int, default=2,
                     help='patience epochs before lr decay in auto schedule')
-    ap.add_argument('--switch-delta', type=float, default=0.5,
+    ap.add_argument('--switch-delta', type=float, default=0.05,
                     help='min loss improvement to reset patience')
     args = ap.parse_args()
     train(args.file, args.epochs, args.batch, args.lr,
-          args.plot, args.plot_diff, args.diff_thresh,
-          args.schedule, args.switch_patience, args.switch_delta)
+          args.plot, args.plot_diff, args.diff_thresh, args.plot_loss, args.plot_ce,
+          args.schedule, args.alpha, args.switch_patience, args.switch_delta)
