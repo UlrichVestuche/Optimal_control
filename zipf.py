@@ -7,6 +7,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 from copy import deepcopy
 import re
+import os
+
+# Detect device for Mac M-series (MPS) or fallback
+device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+print(f"Using device: {device}")
+
+def ensure_dir(path):
+    """Create directory (and parents) if it doesn't exist."""
+    os.makedirs(path, exist_ok=True)
 
 class SymbolDataset(Dataset):
     def __init__(self, text, vocab=None):
@@ -32,8 +41,14 @@ class SymbolDataset(Dataset):
 def train(path, epochs=10, batch=4096, lr=0.1,
           plot=None, plot_diff=None, diff_thresh=0.05,
           plot_loss=None, plot_ce=None,
+          plot_kld=None,
           schedule='constant', alpha=1.0,
-          switch_patience=3, switch_delta=1e-3):
+          switch_patience=3, switch_delta=1e-3,
+          kld_thresh=1e-3, kld_patience=2):
+    # Create output folder for plots to avoid overwriting
+    folder = os.path.join('pic', f'zipf_ep{epochs}_bs{batch}_lr{lr}')
+    ensure_dir(folder)
+
     """
     Train a unigram model to fit Zipf's law via SGD.
     Args:
@@ -52,13 +67,15 @@ def train(path, epochs=10, batch=4096, lr=0.1,
         alpha: exponent for 'power' schedule (lr = lr0 / t^alpha).
         switch_patience: epochs to wait before switching (auto mode).
         switch_delta: minimum loss improvement to reset patience.
+        kld_thresh: threshold for KL divergence change for early stopping.
+        kld_patience: number of epochs to check KL divergence flattening.
     """
     text = pathlib.Path(path).read_text(encoding='utf‑8')
     ds = SymbolDataset(text)
     loader = DataLoader(ds, batch_size=batch, shuffle=True, drop_last=True)
 
     V = len(ds.vocab)
-    logits = torch.nn.Parameter(torch.zeros(V))
+    logits = torch.nn.Parameter(torch.zeros(V, device=device))
     opt = torch.optim.SGD([logits], lr=lr)
 
     ce = torch.nn.CrossEntropyLoss()
@@ -69,6 +86,11 @@ def train(path, epochs=10, batch=4096, lr=0.1,
     emp_dist = np.zeros(V, dtype=float)
     for tok, idx in ds.vocab.items():
         emp_dist[idx] = counts[tok] / total
+
+    # Pre-compute empirical entropy for KL-based early stopping
+    switch_epoch = None  # Record epoch when auto schedule switches to invtime
+    emp_entropy = -np.sum(emp_dist * np.log(emp_dist + 1e-12))
+    kld_list = []
 
     step = 0                   # global step counter
     initial_lr = lr
@@ -82,6 +104,7 @@ def train(path, epochs=10, batch=4096, lr=0.1,
 
     for ep in range(epochs):
         for x in loader:                       # x shape: (B,)
+            x = x.to(device)
             opt.zero_grad()
             loss = ce(logits.repeat(x.size(0), 1), x)   # broadcast
             loss.backward()
@@ -99,17 +122,29 @@ def train(path, epochs=10, batch=4096, lr=0.1,
         current_lr = opt.param_groups[0]['lr']
         print(f'Epoch {ep+1}: loss {loss.item():.4f}  |  lr {current_lr:.3e}')
 
-        # ---- auto schedule logic ----
+        # Early stopping based on KL divergence flattening
+        # Compute KL divergence for this epoch
+        probs_epoch = torch.softmax(logits, 0).detach().cpu().numpy()
+        ce_epoch = -np.sum(emp_dist * np.log(probs_epoch + 1e-12))
+        kld_epoch = ce_epoch - emp_entropy
+        kld_list.append(kld_epoch)
+        
+        # ---- auto schedule logic using KL divergence patience ----
         if schedule == 'auto':
-            if prev_loss is not None and (prev_loss - loss.item()) < switch_delta:
-                stale_epochs += 1
-            else:
-                stale_epochs = 0
-            prev_loss = loss.item()
-
-            if mode != 'invtime' and stale_epochs >= switch_patience:
-                mode = 'invtime'
-                print(f'>>> Switching to 1/t decay after epoch {ep+1}')
+            if len(kld_list) > kld_patience:
+                recent_kld = kld_list[-(kld_patience+1):]
+                diffs_kld = [abs(recent_kld[i] - recent_kld[i+1]) for i in range(len(recent_kld)-1)]
+                if mode != 'invtime' and all(diff < kld_thresh for diff in diffs_kld):
+                    mode = 'invtime'
+                    switch_epoch = ep + 1
+                    print(f'>>> Switching to 1/t decay after epoch {ep+1} due to KL flattening')
+        else:
+            if len(kld_list) > kld_patience:
+                recent = kld_list[-(kld_patience+1):]
+                diffs = [abs(recent[i] - recent[i+1]) for i in range(len(recent)-1)]
+                if all(diff < kld_thresh for diff in diffs):
+                    print(f'Early stopping at epoch {ep+1} due to KL flattening (ΔKL < {kld_thresh} for {kld_patience} epochs)')
+                    break
 
     probs = torch.softmax(logits, 0).detach().cpu().numpy()
     id2sym = {i: s for s, i in ds.vocab.items()}
@@ -117,6 +152,24 @@ def train(path, epochs=10, batch=4096, lr=0.1,
     # compute empirical counts once
     counts = Counter(ds.tokens)
     total = len(ds.tokens)
+
+    # ----- Plot KL divergence vs. epochs -----
+    if plot_kld:
+        import matplotlib.pyplot as plt
+        epochs_range = list(range(1, len(kld_list) + 1))
+        plt.figure(figsize=(6, 4))
+        plt.plot(epochs_range, kld_list, marker='o', label='KL divergence')
+        if switch_epoch:
+            plt.axvline(x=switch_epoch, color='red', linestyle='--', label=f'Switch at epoch {switch_epoch}')
+        plt.xlabel('Epoch')
+        plt.ylabel('KL Divergence')
+        plt.title('KLD over Epochs')
+        plt.legend()
+        plt.tight_layout()
+        kld_filename = os.path.basename(plot_kld)
+        full_kld_path = os.path.join(folder, kld_filename)
+        plt.savefig(full_kld_path)
+        print(f'KL divergence plot saved to {full_kld_path}')
 
     # dump counts + learned probabilities side‑by‑side
     stats = {tok: {"count": counts[tok], "prob": model.get(tok, 0.0)}
@@ -135,6 +188,10 @@ def train(path, epochs=10, batch=4096, lr=0.1,
     learned_entropy = -sum(p * math.log(p) for p in learned_freq if p > 0)
     print(f'Empirical unigram entropy: {emp_entropy:.4f} nats/token')
     print(f'Learned  unigram entropy: {learned_entropy:.4f} nats/token')
+    # Compute and print KL divergence between empirical and learned distributions
+    ce_final = -np.sum(emp_dist * np.log(probs + 1e-12))
+    kld = ce_final - emp_entropy
+    print(f'KL divergence (P_emp || P_model): {kld:.4f} nats/token')
 
     # ----- Plot learned vs. empirical rank–frequency -----
     if plot:
@@ -147,8 +204,10 @@ def train(path, epochs=10, batch=4096, lr=0.1,
         plt.title('Zipf fit')
         plt.legend()
         plt.tight_layout()
-        plt.savefig(plot)
-        print(f'Plot saved to {plot}')
+        plot_filename = os.path.basename(plot)
+        full_plot_path = os.path.join(folder, plot_filename)
+        plt.savefig(full_plot_path)
+        print(f'Plot saved to {full_plot_path}')
 
     # ----- Plot only where the two distributions differ more than threshold -----
     if plot_diff:
@@ -173,32 +232,47 @@ def train(path, epochs=10, batch=4096, lr=0.1,
             plt.title(f'Zipf regions where rel. diff > {diff_thresh}')
             plt.legend()
             plt.tight_layout()
-            plt.savefig(plot_diff)
-            print(f'Diff‑only plot saved to {plot_diff}')
+            diff_filename = os.path.basename(plot_diff)
+            full_diff_path = os.path.join(folder, diff_filename)
+            plt.savefig(full_diff_path)
+            print(f'Diff‑only plot saved to {full_diff_path}')
         else:
             print(f'No ranks exceeded diff_thresh={diff_thresh}; no diff plot written.')
 
-    # ----- Plot loss vs. global steps -----
+    # ----- Plot loss minus empirical entropy vs. global steps (log-log) -----
     if plot_loss:
+        # subtract empirical entropy from the recorded loss and plot in log-log
+        adjusted_loss = np.array(loss_list) - emp_entropy
         plt.figure(figsize=(6, 4))
-        plt.plot(step_list, loss_list)
+        plt.loglog(step_list, adjusted_loss, label='loss − empirical entropy')
         plt.xlabel('step')
-        plt.ylabel('loss')
-        plt.title('Loss vs global step')
+        plt.ylabel('loss minus empirical entropy')
+        plt.title('Loss minus empirical entropy vs global step (log-log)')
+        plt.legend()
         plt.tight_layout()
-        plt.savefig(plot_loss)
-        print(f'Loss vs steps plot saved to {plot_loss}')
+        loss_filename = os.path.basename(plot_loss)
+        full_loss_path = os.path.join(folder, loss_filename)
+        plt.savefig(full_loss_path)
+        print(f'Log-log loss minus empirical entropy plot saved to {full_loss_path}')
 
     # ----- Plot true cross-entropy vs. global steps -----
     if plot_ce:
+        adjusted_ce = np.array(ce_list) - emp_entropy
         plt.figure(figsize=(6, 4))
-        plt.plot(step_list, ce_list)
+        plt.plot(step_list, adjusted_ce, label='true cross-entropy')
+        #plt.axhline(learned_entropy, linestyle='--', label='learned entropy')
         plt.xlabel('step')
-        plt.ylabel('true cross-entropy')
-        plt.title('Cross-entropy vs global step')
+        plt.ylabel('cross-entropy')
+        plt.title('True cross-entropy - Empricial entropy vs global step')
+        plt.legend()
         plt.tight_layout()
-        plt.savefig(plot_ce)
-        print(f'True cross-entropy plot saved to {plot_ce}')
+        ce_filename = os.path.basename(plot_ce)
+        full_ce_path = os.path.join(folder, ce_filename)
+        plt.savefig(full_ce_path)
+        print(f'True cross-entropy with learned entropy plot saved to {full_ce_path}')
+        # Print final true cross-entropy value
+        print(f'Final true cross-entropy: {ce_list[-1]:.4f} nats/token')
+    return kld
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
@@ -212,6 +286,8 @@ if __name__ == '__main__':
                     help='Path to save loss vs. global step plot')
     ap.add_argument('--plot-ce', default=None,
                     help='Path to save true cross-entropy vs global step plot')
+    ap.add_argument('--plot-kld', default=None,
+                    help='Path to save KL divergence vs. epoch plot')
     ap.add_argument('--schedule', choices=['constant', 'invtime', 'power', 'auto'],
                     default='constant',
                     help="Learning‑rate schedule: constant or 1/t ('invtime')")
@@ -228,4 +304,5 @@ if __name__ == '__main__':
     args = ap.parse_args()
     train(args.file, args.epochs, args.batch, args.lr,
           args.plot, args.plot_diff, args.diff_thresh, args.plot_loss, args.plot_ce,
+          args.plot_kld,
           args.schedule, args.alpha, args.switch_patience, args.switch_delta)
