@@ -2,12 +2,11 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from collections import Counter
 import math, json, argparse, pathlib
-from itertools import count
 import matplotlib.pyplot as plt
 import numpy as np
-from copy import deepcopy
 import re
 import os
+import sys
 
 # Detect device for Mac M-series (MPS) or fallback
 device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
@@ -40,13 +39,12 @@ class SymbolDataset(Dataset):
 
 def train(path, epochs=10, batch=4096, lr=0.1,
           plot=None, plot_diff=None, diff_thresh=0.05,
-          plot_loss=None, plot_ce=None,
-          plot_kld=None,
+          plot_loss=None, plot_ce=None, plot_kld=None,
           schedule='constant', alpha=1.0,
-          switch_patience=3, switch_delta=1e-3,
-          kld_thresh=1e-3, kld_patience=2):
+          kld_thresh=0.001, kld_patience=2,
+          init_logits=None, start_epoch: int = 0, start_step: int = 0):
     # Create output folder for plots to avoid overwriting
-    folder = os.path.join('pic', f'zipf_ep{epochs}_bs{batch}_lr{lr}')
+    folder = os.path.join('pic', f'zipf_ep{epochs}_bs{batch}_lr{lr}_sch{schedule}')
     ensure_dir(folder)
 
     """
@@ -61,21 +59,23 @@ def train(path, epochs=10, batch=4096, lr=0.1,
                    where |learned – empirical| / empirical > diff_thresh.
         diff_thresh: relative difference threshold for plot_diff.
         schedule: 'constant', 'invtime', or 'auto'.
-                  'auto' keeps lr constant until the epoch loss fails to
-                  improve by more than switch_delta for switch_patience epochs,
-                  then switches to 1/t decay.
         alpha: exponent for 'power' schedule (lr = lr0 / t^alpha).
-        switch_patience: epochs to wait before switching (auto mode).
-        switch_delta: minimum loss improvement to reset patience.
         kld_thresh: threshold for KL divergence change for early stopping.
         kld_patience: number of epochs to check KL divergence flattening.
     """
     text = pathlib.Path(path).read_text(encoding='utf‑8')
     ds = SymbolDataset(text)
     loader = DataLoader(ds, batch_size=batch, shuffle=True, drop_last=True)
+    # Compute total number of optimization steps for the remaining-power schedule
+    total_steps = epochs * len(loader)
 
     V = len(ds.vocab)
-    logits = torch.nn.Parameter(torch.zeros(V, device=device))
+    if init_logits is not None:
+        logits = init_logits.to(device)
+        if not logits.requires_grad:
+            logits = torch.nn.Parameter(logits)
+    else:
+        logits = torch.nn.Parameter(torch.zeros(V, device=device))
     opt = torch.optim.SGD([logits], lr=lr)
 
     ce = torch.nn.CrossEntropyLoss()
@@ -88,21 +88,35 @@ def train(path, epochs=10, batch=4096, lr=0.1,
         emp_dist[idx] = counts[tok] / total
 
     # Pre-compute empirical entropy for KL-based early stopping
-    switch_epoch = None  # Record epoch when auto schedule switches to invtime
+    switch_step = None  # record the global step when schedule switches
     emp_entropy = -np.sum(emp_dist * np.log(emp_dist + 1e-12))
     kld_list = []
+    kld_step_list = []
+    kld_step_index = []
 
-    step = 0                   # global step counter
+    step = start_step          # global step counter
     initial_lr = lr
-    mode = schedule          # may change from 'auto' to 'invtime'
-    prev_loss = None
-    stale_epochs = 0
+    # Start with a constant learning‑rate for schedules that need an eventual switch
+    # (`auto` should behave like `constant` until the KL plateau, just like
+    #  `remaining_power` does.)
+    if schedule in ('auto', 'remaining_power'):
+        mode = 'constant'
+    else:
+        mode = schedule
+
+    # If we're resuming (start_epoch > 0) we already *are* at the plateau,
+    # so jump straight into the schedule’s post‑plateau phase.
+    if start_epoch > 0:
+        if schedule == 'remaining_power':
+            mode = 'remaining_power'   # skip the constant warm‑up
+        elif schedule == 'auto':
+            mode = 'invtime'           # auto resumes as 1/t decay
 
     step_list = []
     loss_list = []
     ce_list = []
 
-    for ep in range(epochs):
+    for ep in range(start_epoch, start_epoch + epochs):
         for x in loader:                       # x shape: (B,)
             x = x.to(device)
             opt.zero_grad()
@@ -112,64 +126,102 @@ def train(path, epochs=10, batch=4096, lr=0.1,
             step += 1
             step_list.append(step)
             loss_list.append(loss.item())
-            # compute true cross-entropy against empirical distribution
-            probs_np = torch.softmax(logits, 0).detach().cpu().numpy()
+            # compute probabilities once for both true CE and KLD
+            with torch.no_grad():
+                probs_np = torch.softmax(logits, 0).cpu().numpy()
             ce_true = -np.sum(emp_dist * np.log(probs_np + 1e-12))
             ce_list.append(ce_true)
-            if mode in ('invtime', 'power'):
-                new_lr = initial_lr / ((step + 1) ** (alpha if mode == 'power' else 1.0))
-                opt.param_groups[0]['lr'] = new_lr
-        current_lr = opt.param_groups[0]['lr']
-        print(f'Epoch {ep+1}: loss {loss.item():.4f}  |  lr {current_lr:.3e}')
 
-        # Early stopping based on KL divergence flattening
-        # Compute KL divergence for this epoch
-        probs_epoch = torch.softmax(logits, 0).detach().cpu().numpy()
-        ce_epoch = -np.sum(emp_dist * np.log(probs_epoch + 1e-12))
-        kld_epoch = ce_epoch - emp_entropy
+            # compute KLD per step directly from the same probabilities
+            kld_step = ce_true - emp_entropy
+            kld_step_list.append(kld_step)
+            kld_step_index.append(step)
+
+            # Learning-rate updates based on schedule
+            if mode == 'invtime':
+                new_lr = initial_lr / ((step/(100* epochs) + 1) ** 1.0)
+                opt.param_groups[0]['lr'] = new_lr
+            elif mode == 'power':
+                new_lr = initial_lr / ((step + 1) ** alpha)
+                opt.param_groups[0]['lr'] = new_lr
+            elif mode == 'remaining_power':
+                # Apply u(t) = (1 - t/T)^(alpha/(1-alpha)), where T = total_steps
+                frac = 1.0 - (step / float(total_steps))
+                if frac < 0:
+                    frac = 0.0
+                exponent = alpha / (1.0 - alpha)
+                new_lr = initial_lr * (frac ** exponent)
+                opt.param_groups[0]['lr'] = new_lr
+        # ce_true is the cross‑entropy between the *full* empirical distribution and the current model,
+        # so it reflects the “true” loss for the whole corpus rather than just the last minibatch.
+        print(f'Epoch {ep+1}: true CE {ce_true:.4f}  |  lr {opt.param_groups[0]['lr']:.3e}')
+
+        # Early stopping based on KL divergence flattening (using last step's CE)
+        kld_epoch = ce_true - emp_entropy
         kld_list.append(kld_epoch)
         
-        # ---- auto schedule logic using KL divergence patience ----
-        if schedule == 'auto':
-            if len(kld_list) > kld_patience:
-                recent_kld = kld_list[-(kld_patience+1):]
-                diffs_kld = [abs(recent_kld[i] - recent_kld[i+1]) for i in range(len(recent_kld)-1)]
-                if mode != 'invtime' and all(diff < kld_thresh for diff in diffs_kld):
-                    mode = 'invtime'
-                    switch_epoch = ep + 1
-                    print(f'>>> Switching to 1/t decay after epoch {ep+1} due to KL flattening')
+        # ---- Plateau logic using kld_thresh & kld_patience ----
+        if schedule in ('auto', 'remaining_power'):
+            target_mode = 'invtime' if schedule == 'auto' else 'remaining_power'
+            if len(kld_list) >= kld_patience + 1 and mode != target_mode:
+                recent = kld_list[-(kld_patience + 1):]
+                diffs  = [abs(recent[i] - recent[i + 1]) for i in range(kld_patience)]
+                if all(d < kld_thresh for d in diffs):
+                    # --- save a checkpoint only once ---
+                    ckpt_path = 'plateau.ckpt'
+                    if not os.path.exists(ckpt_path):
+                        torch.save({'logits': logits.detach().cpu(),
+                                    'epoch' : ep,
+                                    'step'  : step,
+                                    'path'  : path}, ckpt_path)
+                        print(f'Saved plateau checkpoint → {ckpt_path}')
+                    mode = target_mode
+                    switch_step = step
+                    print(f'>>> Switching to {target_mode} after epoch {ep+1} '
+                          f'due to plateau (|ΔKLD|<{kld_thresh} for {kld_patience} epochs)')
         else:
-            if len(kld_list) > kld_patience:
-                recent = kld_list[-(kld_patience+1):]
-                diffs = [abs(recent[i] - recent[i+1]) for i in range(len(recent)-1)]
-                if all(diff < kld_thresh for diff in diffs):
-                    print(f'Early stopping at epoch {ep+1} due to KL flattening (ΔKL < {kld_thresh} for {kld_patience} epochs)')
+            # For constant / power / invtime schedules, early‑stop using the same criterion
+            if len(kld_list) >= kld_patience + 1:
+                recent = kld_list[-(kld_patience + 1):]
+                diffs  = [abs(recent[i] - recent[i + 1]) for i in range(kld_patience)]
+                if all(d < kld_thresh for d in diffs):
+                    print(f'Early stopping at epoch {ep+1} because KL divergence '
+                          f'flattened (|ΔKLD|<{kld_thresh} for {kld_patience} epochs)')
                     break
 
     probs = torch.softmax(logits, 0).detach().cpu().numpy()
     id2sym = {i: s for s, i in ds.vocab.items()}
     model = {id2sym[i]: float(p) for i, p in enumerate(probs)}
-    # compute empirical counts once
-    counts = Counter(ds.tokens)
-    total = len(ds.tokens)
 
-    # ----- Plot KL divergence vs. epochs -----
+    # --- Persist raw step‑level KLD for later comparison ---
     if plot_kld:
-        import matplotlib.pyplot as plt
-        epochs_range = list(range(1, len(kld_list) + 1))
-        plt.figure(figsize=(6, 4))
-        plt.plot(epochs_range, kld_list, marker='o', label='KL divergence')
-        if switch_epoch:
-            plt.axvline(x=switch_epoch, color='red', linestyle='--', label=f'Switch at epoch {switch_epoch}')
-        plt.xlabel('Epoch')
-        plt.ylabel('KL Divergence')
-        plt.title('KLD over Epochs')
-        plt.legend()
-        plt.tight_layout()
-        kld_filename = os.path.basename(plot_kld)
-        full_kld_path = os.path.join(folder, kld_filename)
-        plt.savefig(full_kld_path)
-        print(f'KL divergence plot saved to {full_kld_path}')
+        kld_data_name = os.path.splitext(os.path.basename(plot_kld))[0] + '.npz'
+        np.savez(os.path.join(folder, kld_data_name),
+                 steps=np.array(kld_step_index),
+                 kld=np.array(kld_step_list))
+    # ----- Plot KL divergence vs. epochs or steps -----
+    if plot_kld:
+        # Only plot after schedule switch and KLD plateau
+        if switch_step is not None:
+            # Identify indices corresponding to steps >= switch_step
+            filtered = [i for i, s in enumerate(kld_step_index) if s >= switch_step]
+            if filtered:
+                steps_to_plot = [kld_step_index[i] for i in filtered]
+                kld_to_plot = [kld_step_list[i] for i in filtered]
+                plt.figure(figsize=(6, 4))
+                plt.plot(steps_to_plot, kld_to_plot, marker='o', label='KLD after schedule switch')
+                plt.xlabel('Global Step')
+                plt.ylabel('KL Divergence')
+                plt.title('KLD over Steps After Schedule Switch')
+                plt.tight_layout()
+                kld_filename = os.path.basename(plot_kld)
+                full_kld_path = os.path.join(folder, kld_filename)
+                plt.savefig(full_kld_path)
+                print(f'KLD over steps plot saved to {full_kld_path}')
+            else:
+                print('No KLD values recorded after schedule switch; no KLD-over-steps plot written.')
+        else:
+            print('Schedule never switched; no KLD-over-steps plot written.')
 
     # dump counts + learned probabilities side‑by‑side
     stats = {tok: {"count": counts[tok], "prob": model.get(tok, 0.0)}
@@ -184,7 +236,6 @@ def train(path, epochs=10, batch=4096, lr=0.1,
     learned_freq = sorted(model.values(), reverse=True)
 
     # ----- Compute and display entropies (in nats) -----
-    emp_entropy = -sum(p * math.log(p) for p in emp_freq if p > 0)
     learned_entropy = -sum(p * math.log(p) for p in learned_freq if p > 0)
     print(f'Empirical unigram entropy: {emp_entropy:.4f} nats/token')
     print(f'Learned  unigram entropy: {learned_entropy:.4f} nats/token')
@@ -274,6 +325,23 @@ def train(path, epochs=10, batch=4096, lr=0.1,
         print(f'Final true cross-entropy: {ce_list[-1]:.4f} nats/token')
     return kld
 
+
+# --- Resume from checkpoint helper ---
+def resume_from_ckpt(ckpt_file: str, new_schedule: str,
+                     epochs: int = 5, reset_step: bool = False, **kwargs):
+    """
+    Resume training from a saved plateau checkpoint with a new LR schedule.
+    """
+    ckpt = torch.load(ckpt_file, map_location=device)
+    logits_param = torch.nn.Parameter(ckpt['logits'].to(device))
+    return train(ckpt['path'],
+                 epochs=epochs,
+                 schedule=new_schedule,
+                 init_logits=logits_param,
+                 start_epoch=ckpt['epoch'] + 1,
+                 start_step=0 if reset_step else ckpt['step'],
+                 **kwargs)
+
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('file', help='plain‑text corpus')
@@ -288,7 +356,7 @@ if __name__ == '__main__':
                     help='Path to save true cross-entropy vs global step plot')
     ap.add_argument('--plot-kld', default=None,
                     help='Path to save KL divergence vs. epoch plot')
-    ap.add_argument('--schedule', choices=['constant', 'invtime', 'power', 'auto'],
+    ap.add_argument('--schedule', choices=['constant', 'invtime', 'power', 'auto', 'remaining_power'],
                     default='constant',
                     help="Learning‑rate schedule: constant or 1/t ('invtime')")
     ap.add_argument('--alpha', type=float, default=1.0,
@@ -297,12 +365,53 @@ if __name__ == '__main__':
                     help='Path to save plot of ranks where learned vs empirical differ')
     ap.add_argument('--diff-thresh', type=float, default=0.1,
                     help='Relative difference threshold for --plot-diff')
-    ap.add_argument('--switch-patience', type=int, default=2,
-                    help='patience epochs before lr decay in auto schedule')
-    ap.add_argument('--switch-delta', type=float, default=0.05,
-                    help='min loss improvement to reset patience')
     args = ap.parse_args()
+    # ----------------------------------------------------------------------------------
+    # If plateau.ckpt already exists, skip fresh training and compare post‑plateau
+    # schedules (invtime vs. remaining_power) right away.
+    # ----------------------------------------------------------------------------------
+    if os.path.exists('plateau.ckpt'):
+        print('Found plateau.ckpt – running schedule comparison from checkpoint...')
+        resume_epochs = args.epochs  # use CLI --epochs for follow‑up phase length
+        resume_from_ckpt('plateau.ckpt', 'remaining_power',
+                         epochs=resume_epochs,
+                         batch=args.batch,
+                         lr=args.lr,
+                         alpha=args.alpha,
+                         plot_kld='rempow_kld.png',
+                         reset_step=True)
+        
+        resume_from_ckpt('plateau.ckpt', 'invtime',
+                         epochs=resume_epochs,
+                         batch=args.batch,
+                         lr=args.lr,
+                         alpha=args.alpha,
+                         plot_kld='invtime_kld.png',
+                         reset_step=True)
+
+        
+
+        # Overlay comparison
+        inv_npz = os.path.join('pic', f'zipf_ep{resume_epochs}_bs{args.batch}_lr{args.lr}_schinvtime',  'invtime_kld.npz')
+        rem_npz = os.path.join('pic', f'zipf_ep{resume_epochs}_bs{args.batch}_lr{args.lr}_schremaining_power', 'rempow_kld.npz')
+        if os.path.exists(inv_npz) and os.path.exists(rem_npz):
+            inv_data = np.load(inv_npz)
+            rem_data = np.load(rem_npz)
+            plt.figure(figsize=(6,4))
+            plt.plot(inv_data['steps'], inv_data['kld'], label='invtime')
+            plt.plot(rem_data['steps'], rem_data['kld'], label='remaining_power')
+            plt.xlabel('Step'); plt.ylabel('KL Divergence')
+            plt.title('Schedule comparison (from checkpoint)')
+            plt.legend(); plt.tight_layout()
+            comp_path = os.path.join('pic', 'kld_compare.png')
+            plt.savefig(comp_path)
+            print(f'Combined KLD comparison saved to {comp_path}')
+        else:
+            print('Could not find KLD data for both schedules; comparison plot skipped.')
+
+        sys.exit(0)
+
     train(args.file, args.epochs, args.batch, args.lr,
           args.plot, args.plot_diff, args.diff_thresh, args.plot_loss, args.plot_ce,
           args.plot_kld,
-          args.schedule, args.alpha, args.switch_patience, args.switch_delta)
+          args.schedule, args.alpha)
