@@ -36,7 +36,13 @@ We compare the classic 1/t (invtime) schedule with our custom remaining‐power 
 > ``` 
 > This choice ensures our remaining-power schedule closely follows the curvature implied by Zipf’s law.
 
+**Final fit**
 
+![zipf_fit](https://github.com/user-attachments/assets/5221fee8-ba23-4ec5-ae96-7f135df0460b)
+
+**Loss curve**
+
+![zipf_loss_ce](https://github.com/user-attachments/assets/72943166-75bf-40f0-8311-c57d964d4611)
 
 
 Quick start
