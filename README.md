@@ -30,7 +30,7 @@ We compare the classic 1/t (invtime) schedule with our custom remaining‐power 
   - Plateau detected around **epoch 4**  
   - Final KL: **0.0012 nats/token**
 
-> **Note**: We choose $\alpha$ based on the empirical Zipf exponent $\nu = 1.05$. Since Zipf’s law distributes word frequencies as $p^{-\nu}$, we set  
+> **Note**: We choose $\alpha$ based on the empirical Zipf exponent $\nu = 1.05$ from Dead Souls. Since Zipf’s law distributes word frequencies as $p^{-\nu}$, we set  
 > ```math
 >   \alpha \;=\; 1 \;-\; \frac{1}{2\nu} \;=\; 1 \;-\; \frac{1}{2 \times 1.05} \;\approx\; 0.524.
 > ``` 
